@@ -1,6 +1,7 @@
 
 import os
 import json
+from cogs.permissions import PermissionTree
 import logging
 from pathlib import Path
 
@@ -94,7 +95,8 @@ class PelayanBot(commands.Bot):
         super().__init__(
             command_prefix=get_prefix,
             intents=intents,
-            help_command=None
+            help_command=None,
+tree_cls=PermissionTree
         )
 
     # ======================================

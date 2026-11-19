@@ -337,7 +337,6 @@ class Leveling(commands.Cog):
         description="Atur channel pengumuman level-up."
     )
     @app_commands.guild_only()
-    @app_commands.checks.has_permissions(manage_guild=True)
     async def level_channel(
         self,
         interaction: discord.Interaction,
@@ -364,7 +363,6 @@ class Leveling(commands.Cog):
         description="Aktifkan atau nonaktifkan sistem XP."
     )
     @app_commands.guild_only()
-    @app_commands.checks.has_permissions(manage_guild=True)
     async def level_toggle(
         self,
         interaction: discord.Interaction,
@@ -501,7 +499,6 @@ class Leveling(commands.Cog):
         name="list",
         description="Lihat semua hadiah role leveling."
     )
-    @app_commands.checks.has_permissions(manage_guild=True)
     async def reward_list(self, interaction: discord.Interaction):
         with sqlite3.connect(DB_PATH) as db:
             rows = db.execute("""
