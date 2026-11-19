@@ -1,0 +1,4 @@
+# Maksimal 1 pesan auto-chat setiap 5 detik per pengguna.
+self.auto_chat_cooldown = commands.CooldownMapping.from_cooldown(
+    1, 5.0, commands.BucketType.user
+)

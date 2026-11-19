@@ -1,0 +1,677 @@
+
+import os
+import re
+import asyncio
+import logging
+from collections import defaultdict, deque
+from urllib.parse import urlparse
+
+import discord
+from discord.ext import commands
+from discord import app_commands
+
+import yt_dlp
+
+# Spotify integration
+try:
+    import spotipy
+    from spotipy.oauth2 import SpotifyClientCredentials
+except ImportError:
+    spotipy = None
+    SpotifyClientCredentials = None
+
+
+log = logging.getLogger("Music")
+
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+
+FFMPEG_OPTIONS = {
+    "before_options": (
+        "-nostdin "
+        "-reconnect 1 "
+        "-reconnect_streamed 1 "
+        "-reconnect_delay_max 5"
+    ),
+    "options": "-vn"
+}
+
+YDL_OPTIONS = {
+    "format": "bestaudio/best",
+    "quiet": True,
+    "no_warnings": True,
+    "noplaylist": True,
+    "extract_flat": False,
+    "socket_timeout": 20,
+    "retries": 3,
+}
+
+YDL_SEARCH_OPTIONS = {
+    **YDL_OPTIONS,
+    "extract_flat": "in_playlist",
+}
+
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
+
+
+# ==========================================
+# SPOTIFY CLIENT
+# ==========================================
+
+spotify = None
+
+if (
+    spotipy
+    and SPOTIFY_CLIENT_ID
+    and SPOTIFY_CLIENT_SECRET
+):
+    try:
+        auth = SpotifyClientCredentials(
+            client_id=SPOTIFY_CLIENT_ID,
+            client_secret=SPOTIFY_CLIENT_SECRET
+        )
+
+        spotify = spotipy.Spotify(
+            auth_manager=auth,
+            requests_timeout=15,
+            retries=2
+        )
+
+        log.info("Spotify integration enabled")
+
+    except Exception:
+        log.exception("Spotify initialization failed")
+
+
+# ==========================================
+# MUSIC COG
+# ==========================================
+
+class Music(
+    commands.GroupCog,
+    group_name="music",
+    group_description="Music player commands"
+):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+        self.queues = defaultdict(deque)
+        self.current = {}
+        self.volumes = defaultdict(lambda: 0.5)
+        self.channels = {}
+        self.locks = defaultdict(asyncio.Lock)
+
+    # ======================================
+    # HELPERS
+    # ======================================
+
+    async def respond(
+        self,
+        interaction: discord.Interaction,
+        content: str,
+        ephemeral: bool = False
+    ):
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                content,
+                ephemeral=ephemeral
+            )
+        else:
+            await interaction.response.send_message(
+                content,
+                ephemeral=ephemeral
+            )
+
+    def is_spotify_url(self, query: str) -> bool:
+        return (
+            "open.spotify.com/track/" in query
+            or "spotify:track:" in query
+        )
+
+    def get_spotify_track_id(self, query: str):
+        match = re.search(
+            r"(?:track/|spotify:track:)([a-zA-Z0-9]+)",
+            query
+        )
+
+        return match.group(1) if match else None
+
+    def is_url(self, query: str) -> bool:
+        try:
+            parsed = urlparse(query)
+            return parsed.scheme in ("http", "https")
+        except Exception:
+            return False
+
+    async def run_ytdlp(self, query: str, search=False):
+        options = (
+            YDL_SEARCH_OPTIONS if search
+            else YDL_OPTIONS
+        )
+
+        def extract():
+            with yt_dlp.YoutubeDL(options) as ydl:
+                return ydl.extract_info(
+                    query,
+                    download=False
+                )
+
+        return await asyncio.to_thread(extract)
+
+    # ======================================
+    # SPOTIFY RESOLVER
+    # ======================================
+
+    async def resolve_spotify(self, query: str):
+        if not spotify:
+            raise RuntimeError(
+                "Spotify belum dikonfigurasi. "
+                "Periksa SPOTIFY_CLIENT_ID dan "
+                "SPOTIFY_CLIENT_SECRET di .env"
+            )
+
+        track_id = self.get_spotify_track_id(query)
+
+        if not track_id:
+            raise RuntimeError("Link Spotify tidak valid.")
+
+        def get_track():
+            return spotify.track(track_id)
+
+        track = await asyncio.to_thread(get_track)
+
+        title = track["name"]
+
+        artists = ", ".join(
+            artist["name"]
+            for artist in track["artists"]
+        )
+
+        search_query = f"{title} {artists}"
+
+        log.info(
+            "Resolving Spotify track: %s",
+            search_query
+        )
+
+        info = await self.run_ytdlp(
+            f"ytsearch1:{search_query}",
+            search=True
+        )
+
+        entries = info.get("entries", [])
+
+        if not entries:
+            raise RuntimeError(
+                "Lagu Spotify tidak ditemukan di YouTube."
+            )
+
+        result = entries[0]
+
+        return {
+            "title": title,
+            "artist": artists,
+"url": result.get("webpage_url") or result.get("original_url"),
+            "requester": None,
+        }
+
+    # ======================================
+    # YOUTUBE RESOLVER
+    # ======================================
+
+
+async def resolve_youtube(self, query: str):
+    search_query = query if self.is_url(query) else f"ytsearch1:{query}"
+
+    info = await self.run_ytdlp(
+        search_query,
+        search=not self.is_url(query)
+    )
+
+    if info.get("entries"):
+        info = info["entries"][0]
+
+    if not info:
+        raise RuntimeError("Lagu tidak ditemukan.")
+
+    url = (
+        info.get("webpage_url")
+        or info.get("original_url")
+    )
+
+    # Hasil ytsearch terkadang hanya memberikan ID video.
+    if not url:
+        video_id = info.get("id")
+        if video_id:
+            url = f"https://www.youtube.com/watch?v={video_id}"
+
+    if not url or not self.is_url(url):
+        raise RuntimeError(
+            f"URL video tidak ditemukan. Data hasil: {info}"
+        )
+
+    return {
+        "title": info.get("title", "Unknown title"),
+        "artist": info.get("uploader", "Unknown artist"),
+        "url": url,
+        "requester": None,
+    }
+
+    # ======================================
+    # TRACK RESOLVER
+    # ======================================
+
+    async def resolve_track(self, query: str):
+        if self.is_spotify_url(query):
+            return await self.resolve_spotify(query)
+
+        return await self.resolve_youtube(query)
+
+    # ======================================
+    # GET VOICE CLIENT
+    # ======================================
+
+    async def get_voice(self, interaction):
+        if not interaction.guild:
+            raise RuntimeError(
+                "Command hanya bisa digunakan di server."
+            )
+
+        if not interaction.user.voice:
+            raise RuntimeError(
+                "Kamu harus masuk voice channel terlebih dahulu."
+            )
+
+        channel = interaction.user.voice.channel
+
+        voice = interaction.guild.voice_client
+
+        if voice is None:
+            voice = await channel.connect()
+
+        elif voice.channel != channel:
+            await voice.move_to(channel)
+
+        return voice
+
+    # ======================================
+    # START NEXT TRACK
+    # ======================================
+
+    async def play_next(self, guild_id: int):
+
+        async with self.locks[guild_id]:
+
+            guild = self.bot.get_guild(guild_id)
+
+            if guild is None:
+                return
+
+            voice = guild.voice_client
+
+            if voice is None or not voice.is_connected():
+                return
+
+            if voice.is_playing() or voice.is_paused():
+                return
+
+            if not self.queues[guild_id]:
+                self.current.pop(guild_id, None)
+                return
+
+            track = self.queues[guild_id].popleft()
+
+            try:
+                # Refresh stream URL when the track starts.
+                info = await self.run_ytdlp(track["url"])
+
+                if info.get("entries"):
+                    info = info["entries"][0]
+
+                stream_url = info.get("url")
+
+                if not stream_url:
+                    raise RuntimeError(
+                        "Audio stream URL tidak ditemukan."
+                    )
+
+                source = discord.PCMVolumeTransformer(
+                    discord.FFmpegPCMAudio(
+                        stream_url,
+                        **FFMPEG_OPTIONS
+                    ),
+                    volume=self.volumes[guild_id]
+                )
+
+                self.current[guild_id] = track
+
+                def after_play(error):
+                    if error:
+                        log.error(
+                            "Playback error: %s",
+                            error
+                        )
+
+                    try:
+                        self.bot.loop.call_soon_threadsafe(
+                            lambda: asyncio.create_task(
+                                self.play_next(guild_id)
+                            )
+                        )
+                    except RuntimeError:
+                        log.warning(
+                            "Event loop is already closed."
+                        )
+
+                voice.play(
+                    source,
+                    after=after_play
+                )
+
+                channel = self.channels.get(guild_id)
+
+                if channel:
+                    await channel.send(
+                        f"🎵 Sekarang memutar: "
+                        f"**{track['title']}**"
+                    )
+
+                log.info(
+                    "Playing: %s",
+                    track["title"]
+                )
+
+            except Exception:
+                log.exception(
+                    "Failed to play track: %s",
+                    track.get("title")
+                )
+
+                channel = self.channels.get(guild_id)
+
+                if channel:
+                    try:
+                        await channel.send(
+                            "⚠️ Gagal memutar lagu: "
+                            f"**{track['title']}**. "
+                            "Mencoba lagu berikutnya..."
+                        )
+                    except discord.HTTPException:
+                        pass
+
+                self.bot.loop.call_soon(
+                    lambda: asyncio.create_task(
+                        self.play_next(guild_id)
+                    )
+                )
+
+    # ======================================
+    # PLAY COMMAND
+    # ======================================
+
+    @app_commands.command(
+        name="play",
+        description="Play music from YouTube or Spotify"
+    )
+    @app_commands.describe(
+        query="YouTube URL, Spotify URL, or song name"
+    )
+    async def play(
+        self,
+        interaction: discord.Interaction,
+        query: str
+    ):
+        # Respond immediately to prevent Unknown interaction.
+        await interaction.response.defer(
+            thinking=True
+        )
+
+        try:
+            voice = await self.get_voice(interaction)
+
+            track = await self.resolve_track(query)
+
+            track["requester"] = interaction.user.display_name
+
+            guild_id = interaction.guild.id
+
+            self.channels[guild_id] = interaction.channel
+
+            self.queues[guild_id].append(track)
+
+            if not voice.is_playing() and not voice.is_paused():
+                await self.play_next(guild_id)
+
+            else:
+                await interaction.followup.send(
+                    f"➕ Ditambahkan ke antrean: "
+                    f"**{track['title']}**"
+                )
+                return
+
+            await interaction.followup.send(
+                f"✅ Berhasil menambahkan: "
+                f"**{track['title']}**"
+            )
+
+        except Exception as error:
+            log.exception("Play command failed")
+
+            await interaction.followup.send(
+                f"❌ Gagal memutar lagu: {error}",
+                ephemeral=True
+            )
+
+    # ======================================
+    # PAUSE COMMAND
+    # ======================================
+
+    @app_commands.command(
+        name="pause",
+        description="Pause current music"
+    )
+    async def pause(self, interaction: discord.Interaction):
+        voice = interaction.guild.voice_client
+
+        if voice and voice.is_playing():
+            voice.pause()
+            await interaction.response.send_message(
+                "⏸️ Musik dijeda."
+            )
+        else:
+            await interaction.response.send_message(
+                "Tidak ada musik yang sedang diputar.",
+                ephemeral=True
+            )
+
+    # ======================================
+    # RESUME COMMAND
+    # ======================================
+
+    @app_commands.command(
+        name="resume",
+        description="Resume current music"
+    )
+    async def resume(self, interaction: discord.Interaction):
+        voice = interaction.guild.voice_client
+
+        if voice and voice.is_paused():
+            voice.resume()
+            await interaction.response.send_message(
+                "▶️ Musik dilanjutkan."
+            )
+        else:
+            await interaction.response.send_message(
+                "Tidak ada musik yang sedang dijeda.",
+                ephemeral=True
+            )
+
+    # ======================================
+    # SKIP COMMAND
+    # ======================================
+
+    @app_commands.command(
+        name="skip",
+        description="Skip current music"
+    )
+    async def skip(self, interaction: discord.Interaction):
+        voice = interaction.guild.voice_client
+
+        if voice and (voice.is_playing() or voice.is_paused()):
+            voice.stop()
+
+            await interaction.response.send_message(
+                "⏭️ Lagu dilewati."
+            )
+        else:
+            await interaction.response.send_message(
+                "Tidak ada lagu yang sedang diputar.",
+                ephemeral=True
+            )
+
+    # ======================================
+    # QUEUE COMMAND
+    # ======================================
+
+    @app_commands.command(
+        name="queue",
+        description="Show music queue"
+    )
+    async def queue(self, interaction: discord.Interaction):
+        guild_id = interaction.guild.id
+
+        current = self.current.get(guild_id)
+        queue = self.queues[guild_id]
+
+        embed = discord.Embed(
+            title="🎵 Music Queue",
+            color=discord.Color.blurple()
+        )
+
+        if current:
+            embed.add_field(
+                name="Now Playing",
+                value=f"🎶 {current['title']}",
+                inline=False
+            )
+
+        if queue:
+            songs = []
+
+            for index, track in enumerate(
+                list(queue)[:15],
+                start=1
+            ):
+                songs.append(
+                    f"`{index}.` {track['title']}"
+                )
+
+            embed.add_field(
+                name="Up Next",
+                value="\n".join(songs),
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="Up Next",
+                value="Antrean kosong.",
+                inline=False
+            )
+
+        await interaction.response.send_message(
+            embed=embed
+        )
+
+    # ======================================
+    # STOP COMMAND
+    # ======================================
+
+    @app_commands.command(
+        name="stop",
+        description="Stop music and clear queue"
+    )
+    async def stop(self, interaction: discord.Interaction):
+        guild_id = interaction.guild.id
+        voice = interaction.guild.voice_client
+
+        self.queues[guild_id].clear()
+        self.current.pop(guild_id, None)
+
+        if voice and (voice.is_playing() or voice.is_paused()):
+            voice.stop()
+
+        await interaction.response.send_message(
+            "⏹️ Musik dihentikan dan antrean dibersihkan."
+        )
+
+    # ======================================
+    # LEAVE COMMAND
+    # ======================================
+
+    @app_commands.command(
+        name="leave",
+        description="Disconnect from voice channel"
+    )
+    async def leave(self, interaction: discord.Interaction):
+        guild_id = interaction.guild.id
+        voice = interaction.guild.voice_client
+
+        self.queues[guild_id].clear()
+        self.current.pop(guild_id, None)
+
+        if voice:
+            await voice.disconnect(force=True)
+
+            await interaction.response.send_message(
+                "👋 Bot keluar dari voice channel."
+            )
+        else:
+            await interaction.response.send_message(
+                "Bot tidak sedang berada di voice channel.",
+                ephemeral=True
+            )
+
+    # ======================================
+    # VOLUME COMMAND
+    # ======================================
+
+    @app_commands.command(
+        name="volume",
+        description="Set music volume (0-200)"
+    )
+    @app_commands.describe(
+        volume="Volume percentage (0-200)"
+    )
+    async def volume(
+        self,
+        interaction: discord.Interaction,
+        volume: app_commands.Range[int, 0, 200]
+    ):
+        guild_id = interaction.guild.id
+
+        self.volumes[guild_id] = volume / 100
+
+        voice = interaction.guild.voice_client
+
+        if voice and voice.source:
+            if isinstance(
+                voice.source,
+                discord.PCMVolumeTransformer
+            ):
+                voice.source.volume = volume / 100
+
+        await interaction.response.send_message(
+            f"🔊 Volume diatur ke **{volume}%**."
+        )
+
+
+# ==========================================
+# SETUP
+# ==========================================
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(Music(bot))
+    log.info("Music cog loaded successfully")
