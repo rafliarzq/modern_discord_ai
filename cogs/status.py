@@ -9,7 +9,7 @@ class Status(commands.Cog):
         self.index = 0
 
         self.activities = [
-            discord.Game(name="AI Assistant"),
+            discord.Game(name="This BOT"),
             discord.Activity(
                 type=discord.ActivityType.watching,
                 name="Made by  : @Rafliarzq"
@@ -18,7 +18,7 @@ class Status(commands.Cog):
                 type=discord.ActivityType.listening,
                 name="AI Commands : /help"
             ),
-            discord.Game(name="Artificial Intelligence"),
+            discord.Game(name="Support our community!"),
             discord.Activity(
                 type=discord.ActivityType.watching,
                 name="Our Community Since 2025"
@@ -27,7 +27,7 @@ class Status(commands.Cog):
 
         self.rotate_status.start()
 
-    @tasks.loop(seconds=30)
+    @tasks.loop(seconds=5)
     async def rotate_status(self):
         activity = self.activities[self.index]
 
